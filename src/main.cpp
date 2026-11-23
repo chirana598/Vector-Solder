@@ -1,5 +1,5 @@
 // ============================================================================
-//  Soldering Iron Controller — STM32  v0.3
+//  Soldering Iron Controller — STM32  v0.5
 // ============================================================================
 #include <Arduino.h>
 #include <U8g2lib.h>
@@ -12,14 +12,14 @@
 //  PINS
 // ============================================================================
 
-#define MAX6675_MISO PA6 
+#define MAX6675_MISO PA6
 #define MAX6675_SCK PA5
 #define MAX6675_CS PA4
 
 #define VIN_PIN PA0
 #define I_PIN PA3
 #define HANDLE_SENSE_PIN PA8
-#define BOOST_PIN PA14
+#define ENABLE_PIN PB5
 
 #define ENC_SW_PIN PB4
 #define ENC_DT_PIN PB3
@@ -34,10 +34,11 @@
 // ============================================================================
 //  CONSTANTS
 // ============================================================================
-#define VERSION "v0.4"
+#define VERSION "v0.5"
 #define TIPMAX 8
 #define TIPNAMELENGTH 6
-#define TIPNAME "C245"
+#define TIPNAME "C245-i"
+#define POWER_SELECTED 65
 
 #define TEMP_MIN 150
 #define TEMP_MAX 450
@@ -52,7 +53,7 @@
 
 #define TIME2SETTLE 5000    // µs — OpAmp settle time
 #define SMOOTHIE 0.2f       // EMA smoothing factor
-#define SENSOR_INTERVAL 100 // ms between sensor reads
+#define SENSOR_INTERVAL 250 // ms between sensor reads
 
 #define CURRENT_LIMIT 4.2f
 #define VOLTAGE_MAX 26.0f
@@ -77,11 +78,6 @@
 #define MODE_RUN 2
 #define MODE_HOLD 3
 #define MODE_BOOST 4
-
-#define ADC_FLOOR 10     // ADC counts at 0°C — measure cold and adjust
-#define TEMP_SCALE 0.134f // °C per ADC count — 1/(147 × 41e-6 × 4095/3.3)
-
-
 
 // ============================================================================
 //  DATA STRUCTURES
@@ -151,7 +147,7 @@ uint8_t InputNameScreen();
 //  DISPLAY + ENCODER
 // ============================================================================
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g(U8G2_R0);
-RotaryEncoder encoder(ENC_DT_PIN, ENC_CLK_PIN, RotaryEncoder::LatchMode::TWO03);
+RotaryEncoder encoder(ENC_CLK_PIN, ENC_DT_PIN, RotaryEncoder::LatchMode::FOUR3);
 MAX6675 thermocouple(MAX6675_SCK, MAX6675_CS, MAX6675_MISO);
 
 // ============================================================================
@@ -283,8 +279,6 @@ int16_t tipTrim[TIPMAX]; // stored per tip in EEPROM
 int16_t activeTrim = 0;  // loaded from tipTrim[CurrentTip], used by calculateTemp
 int16_t TempOffset[TIPMAX];
 
-
-
 // ============================================================================
 //  BUTTON
 // ============================================================================
@@ -372,7 +366,6 @@ void processButton()
   }
 }
 
-
 // ============================================================================
 //  BUZZER
 // ============================================================================
@@ -403,11 +396,17 @@ void SENSORCheck()
 {
   float rawTemp = thermocouple.readCelsius();
 
-  if (!tempInit) { SmoothedTEMP = rawTemp;  tempInit = true; }
-  else           { SmoothedTEMP += SMOOTHIE * (rawTemp - SmoothedTEMP); }
+  if (!tempInit)
+  {
+    SmoothedTEMP = rawTemp;
+    tempInit = true;
+  }
+  else
+  {
+    SmoothedTEMP += SMOOTHIE * (rawTemp - SmoothedTEMP);
+  }
 
   CurrentTemp = SmoothedTEMP;
-
 }
 
 // ============================================================================
@@ -561,12 +560,14 @@ void PowerCheck()
     analogWrite(CTRL_PIN, 0);
     MessageScreen(OverCURRmessage, 2);
   }
-  if (VOLTAGE >= VOLTAGE_MAX || (VOLTAGE > 0.5f && VOLTAGE <= VOLTAGE_MIN))
-  {
-    mode = MODE_OFF;
-    analogWrite(CTRL_PIN, 0);
-    MessageScreen(OverVOLTmessage, 2);
-  }
+  /*
+   if (VOLTAGE >= VOLTAGE_MAX || (VOLTAGE > 0.5f && VOLTAGE <= VOLTAGE_MIN))
+   {
+     mode = MODE_OFF;
+     analogWrite(CTRL_PIN, 0);
+     MessageScreen(OverVOLTmessage, 2);
+   }
+     */
 }
 
 // ============================================================================
@@ -604,8 +605,6 @@ void LED_Handler()
 void MainScreen()
 {
   SetTemp = (uint16_t)getRotary();
-
-  uint16_t dispTemp = (uint16_t)CurrentTemp;
   uint8_t pwmPct = (uint8_t)map((long)Output, 0, 255, 0, 100);
 
   u8g.firstPage();
@@ -618,82 +617,103 @@ void MainScreen()
     u8g.setCursor(0, 0);
     u8g.print(TipName[CurrentTip]);
 
-    u8g.setCursor(74, 0);
+    u8g.setCursor(90, 0);
     switch (mode)
     {
     case MODE_OFF:
-      u8g.print(F("  OFF"));
+      u8g.print(F("OFF"));
       break;
     case MODE_SLEEP:
-      u8g.print(F(" STBY"));
+      u8g.print(F("STBY"));
       break;
     case MODE_BOOST:
+      u8g.setCursor(85, 0);
       u8g.print(F("BOOST"));
       break;
     case MODE_HOLD:
-      u8g.print(F(" HOLD"));
+      u8g.print(F("HOLD"));
       break;
     case MODE_RUN:
-      u8g.print(F(" HEAT"));
+      u8g.print(F("HEAT"));
       break;
     default:
       u8g.print(F("-----"));
       break;
     }
-
+    // clang-format off
+ 
     u8g.drawHLine(0, 14, 128);
 
     // ── Centre: large current temperature ───────────────────────────────
     u8g.setFont(u8g2_font_fub25_tf);
     u8g.setFontPosTop();
 
-    if (dispTemp > 999)
+    if (CurrentTemp > TEMP_MAX)
     {
-      u8g.setCursor(20, 17);
+      u8g.setCursor(35, 17);
       u8g.print(F("OVT"));
     }
     else
     {
-      // Right-align 1-3 digit number, leaving room for °C at x=100
-      if (dispTemp < 10)
-        u8g.setCursor(72, 17);
-      else if (dispTemp < 100)
-        u8g.setCursor(54, 17);
-      else
-        u8g.setCursor(36, 17);
-      u8g.print(dispTemp);
+      u8g.setCursor((CurrentTemp < 10) ? 100 : (CurrentTemp < 100) ? 68: 48,17);
+      u8g.print((uint16_t)CurrentTemp);
     }
 
     // °C — small font, top-right of temp area
     u8g.setFont(u8g2_font_9x15_tf);
     u8g.setFontPosTop();
-    u8g.setCursor(101, 17);
-    u8g.print(F("\xb0"
-                "C"));
+    u8g.setCursor(106, 30);
+    u8g.print(F("\xb0""C"));
 
     // ── Bottom bar ───────────────────────────────────────────────────────
     u8g.drawHLine(0, 48, 128);
 
     // PWM%
     u8g.setCursor(0, 51);
-    u8g.print(pwmPct);
-    u8g.print(F("%"));
+    u8g.print(POWER_SELECTED);
+    u8g.print(F("W"));
+
+    u8g.setCursor(0, 18);
+    u8g.print(F("PWR"));
+    u8g.setCursor(0, 33);
+
+    if (pwmPct >= 99)
+    {
+      u8g.drawButtonUTF8(0, 34, U8G2_BTN_INV, 5, 1, 1, "MAX");
+    }
+    else if (pwmPct == 0)
+    {
+      u8g.drawButtonUTF8(0, 34, U8G2_BTN_INV, 5, 1, 1, "OFF");
+    }
+    else
+    {
+      u8g.print(pwmPct);
+      u8g.print(F("%"));
+    }
 
     // SET temp
-    u8g.setCursor(38, 51);
+    u8g.setCursor(43, 51);
     u8g.print(F("SET:"));
-    u8g.setCursor(74, 51);
+    if (SetTemp < 100)
+    {
+      u8g.setCursor(89, 51);
+    }
+    else
+    {
+      u8g.setCursor(80, 51);
+    }
     u8g.print(SetTemp);
-    u8g.print(F("\xb0"
-                "C"));
+    u8g.print(F("\xb0""C"));
 
     // Boost countdown
     if (mode == MODE_BOOST && timeOfBoost > 0)
     {
-      u8g.setCursor(106, 51);
+      u8g.setCursor(50, 0);
       u8g.print(timeOfBoost - goneSeconds);
       u8g.print(F("s"));
     }
+
+    // clang-format on
 
   } while (u8g.nextPage());
 }
@@ -1359,7 +1379,7 @@ void setup()
   pinMode(VIN_PIN, INPUT_ANALOG);
   pinMode(I_PIN, INPUT_ANALOG);
   pinMode(HANDLE_SENSE_PIN, INPUT_PULLDOWN);
-  pinMode(BOOST_PIN, INPUT_PULLDOWN);
+  pinMode(ENABLE_PIN, INPUT_PULLDOWN);
   pinMode(BUZZ_PIN, OUTPUT);
   pinMode(CTRL_PIN, OUTPUT);
   pinMode(ENC_DT_PIN, INPUT_PULLUP);
@@ -1397,9 +1417,9 @@ void setup()
 
   setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, DefaultTemp);
 
-  digitalWrite(PB2, HIGH);
+  digitalWrite(PC13, HIGH);
   delay(3000);
-  digitalWrite(PB2, LOW);
+  digitalWrite(PC13, LOW);
 
   BUZZ(300, 2);
 }
@@ -1424,4 +1444,6 @@ void loop()
   ROTARYCheck();
   MainScreen();
   LED_Handler();
+
+  digitalWrite(PC13, HIGH);
 }

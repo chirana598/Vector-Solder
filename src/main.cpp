@@ -1,7 +1,8 @@
 // ============================================================================
-//  Soldering Iron Controller — STM32  v0.5
+//  Soldering Iron Controller — STM32F103 + MAX6675 + C245   v0.6
 // ============================================================================
 #include <Arduino.h>
+#include <math.h>
 #include <U8g2lib.h>
 #include <PID_v1.h>
 #include <RotaryEncoder.h>
@@ -11,7 +12,6 @@
 // ============================================================================
 //  PINS
 // ============================================================================
-
 #define MAX6675_MISO PA6
 #define MAX6675_SCK PA5
 #define MAX6675_CS PA4
@@ -19,7 +19,7 @@
 #define VIN_PIN PA0
 #define I_PIN PA3
 #define HANDLE_SENSE_PIN PA8
-#define ENABLE_PIN PB5
+#define ENABLE_PIN PB5 
 
 #define ENC_SW_PIN PB4
 #define ENC_DT_PIN PB3
@@ -34,11 +34,12 @@
 // ============================================================================
 //  CONSTANTS
 // ============================================================================
-#define VERSION "v0.5"
+#define VERSION "v0.6"
 #define TIPMAX 8
-#define TIPNAMELENGTH 6
+#define TIPNAMELENGTH 7 // 6 chars + terminating NUL  (was 6 -> no NUL, overran)
 #define TIPNAME "C245-i"
-#define POWER_SELECTED 65
+
+#define DEG "\xc2\xb0" // UTF-8 degree sign (enableUTF8Print is on)
 
 #define TEMP_MIN 150
 #define TEMP_MAX 450
@@ -50,28 +51,50 @@
 #define TIME2SLEEP 5   // minutes
 #define TIME2OFF 15    // minutes
 #define TIMEOFBOOST 40 // seconds
+#define TEMP_SETTLE_MS 10   // heater-off settle time before reading the MAX6675
 
-#define TIME2SETTLE 5000    // µs — OpAmp settle time
 #define SMOOTHIE 0.2f       // EMA smoothing factor
-#define SENSOR_INTERVAL 250 // ms between sensor reads
+#define SENSOR_INTERVAL 250 // ms (MAX6675 needs >= 220 ms per conversion)
 
-#define CURRENT_LIMIT 4.2f
+// ---- Debug --------------------------------------------------------------
+// While DEBUG is ON: the "tip missing" error and the supply-voltage check are
+// disabled (no error screens).  Changeable at runtime: Setup -> Debug.
+#define DEBUG_DEFAULT true
+
+// ---- Power / current sensing (0.01 ohm shunt) ---------------------------
+#define SHUNT_OHMS 0.01f
+// Gain of the shunt amplifier.  *** CALIBRATE FOR YOUR BOARD ***
+//   gain = V_adc_pin / (I_measured * SHUNT_OHMS)
+// 80 is chosen so ADC full scale (3.3 V) is ~4.1 A, like the old table.
+#define I_AMP_GAIN 80.0f
+#define ADC_VREF 3.3f
+#define ADC_MAX 4095.0f
+#define VIN_DIV 0.09f           // input voltage divider ratio
+#define I_SAMPLE_US 2000        // average current over 2 PWM periods (1 kHz)
+#define CURRENT_LIMIT 4.0f      // A, hard trip (average)
 #define VOLTAGE_MAX 26.0f
 #define VOLTAGE_MIN 5.0f
+#define TIP_R_NOMINAL 2.5f      // ohm, only used for the first power estimate
 
-#define PID_ENABLE true
+#define POWER_DEFAULT 65 // W
+#define POWER_MIN 10
+#define POWER_MAX_ABS 100
+
 #define BEEP_ENABLE true
+#define PID_ENABLE true
 #define DEFAULT_BUZZ_MS 200
 
 #define LONG_PRESS_TIME 650
 #define DEBOUNCE_TIME 30
 
-#define STABLE_TOLERANCE 5   // ADC counts
-#define STABLE_DURATION 2000 // ms
-#define FLASH_INTERVAL 300   // ms
+#define TIP_FAULT_COUNT 3 // consecutive bad reads before "tip missing"
+
+// Logic levels
+#define STAND_ACTIVE_LEVEL HIGH  // HANDLE_SENSE level when iron is on stand
+#define ENABLE_ACTIVE_LEVEL HIGH // ENABLE_PIN level when pressed (pull-down)
 
 // ============================================================================
-//  MODES   0=OFF  1=SLEEP  2=RUN  3=HOLD  4=BOOST
+//  MODES   0=OFF  1=SLEEP(standby)  2=RUN  3=HOLD  4=BOOST
 // ============================================================================
 #define MODE_OFF 0
 #define MODE_SLEEP 1
@@ -82,12 +105,6 @@
 // ============================================================================
 //  DATA STRUCTURES
 // ============================================================================
-struct CalPoint
-{
-  uint16_t adc;
-  uint16_t temp;
-};
-
 struct Settings
 {
   uint32_t signature;
@@ -102,8 +119,10 @@ struct Settings
   bool beepEnable;
   uint8_t CurrentTip;
   uint8_t NumberOfTips;
-  int16_t TempOffset[TIPMAX]; // per-tip trim, ±200°C range
+  int16_t TempOffset[TIPMAX]; // per-tip trim
   char TipName[TIPMAX][TIPNAMELENGTH];
+  uint8_t MaxPower;
+  bool debugMode;
 };
 
 // ============================================================================
@@ -114,18 +133,18 @@ void setRotary(int rmin, int rmax, int rstep, int rvalue);
 int getRotary();
 void handleButton();
 void processButton();
+void handleEnableButton();
 void ROTARYCheck();
 void SENSORCheck();
 void Thermostat();
 void PowerCheck();
 void SLEEPCheck();
-void stabilityReset();
-void stabilityUpdate();
+void TipCheck();
+void runControlCycle();
 void LED_Handler();
 void BUZZ(long duration = DEFAULT_BUZZ_MS, int buzzcount = 1);
 void loadSettings();
 void saveSettings();
-float calculateTemp(int adc);
 
 void MainScreen();
 void SetupScreen();
@@ -144,7 +163,7 @@ uint16_t InputScreen(const char *Items[]);
 uint8_t InputNameScreen();
 
 // ============================================================================
-//  DISPLAY + ENCODER
+//  DISPLAY + ENCODER + SENSOR
 // ============================================================================
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g(U8G2_R0);
 RotaryEncoder encoder(ENC_CLK_PIN, ENC_DT_PIN, RotaryEncoder::LatchMode::FOUR3);
@@ -155,50 +174,57 @@ MAX6675 thermocouple(MAX6675_SCK, MAX6675_CS, MAX6675_MISO);
 // ============================================================================
 const char *SetupItems[] = {"Setup Menu", "Tip Settings", "Temp Settings",
                             "Timers", "General", "Buzzer",
-                            "Information", "Return"};
+                            "Information", "Debug", "Return"};
 const char *TipItems[] = {"Tip:", "Change Tip", "Calibrate Tip",
                           "Rename Tip", "Delete Tip", "Add new Tip", "Return"};
 const char *TempItems[] = {"Temp Settings", "Default Temp", "Sleep Temp",
-                           "Boost Temp", "Return"};
+                           "Boost Temp", "Max Power", "Return"};
 const char *TimerItems[] = {"Timer Settings", "Sleep Timer", "Off Timer",
                             "Boost Timer", "Return"};
 const char *ControlTypeItems[] = {"Control Type", "Direct", "PID"};
-const char *StoreItems[] = {"Store Settings?", "No", "Yes"};
 const char *SureItems[] = {"Are you sure?", "No", "Yes"};
 const char *BuzzerItems[] = {"Buzzer", "Disable", "Enable"};
+const char *DebugItems[] = {"Debug Mode", "Off", "On"};
 const char *DefaultTempItems[] = {"Default Temp", "deg C"};
 const char *SleepTempItems[] = {"Sleep Temp", "deg C"};
 const char *BoostTempItems[] = {"Boost Temp", "deg C"};
+const char *MaxPowerItems[] = {"Max Power", "Watts"};
 const char *SleepTimerItems[] = {"Sleep Timer", "Minutes"};
 const char *OffTimerItems[] = {"Off Timer", "Minutes"};
 const char *BoostTimerItems[] = {"Boost Timer", "Seconds"};
 const char *DeleteMessage[] = {"Warning", "Cannot delete", "your last tip!"};
 const char *OverVOLTmessage[] = {"VOLTAGE FAULT", "DISCONNECT"};
 const char *OverCURRmessage[] = {"OVER CURRENT", "AUTO CUTOFF"};
+const char *TipMissingMessage[] = {"TIP MISSING!", "Check tip &", "connection."};
 const char *MaxTipMessage[] = {"Max tips reached"};
-const char *BadCalMessage[] = {"Cal invalid!", "Need 2+ pts,", "ADC & temp", "must increase."};
 
 // ============================================================================
 //  GLOBAL STATE
 // ============================================================================
-uint8_t mode = MODE_RUN;
+uint8_t mode = MODE_SLEEP; // boots into standby
 
 // Temperature pipeline
 float SmoothedTEMP = 0;
 double Input = 0, Output = 0, Setpoint = 0;
-double RawTemp = 0, CurrentTemp = 0;
+double CurrentTemp = 0;
 uint16_t SetTemp = TEMP_DEFAULT;
-float ShowTemp = 0;
 uint16_t gap = 0;
 bool tempInit = false;
+bool tipOK = false; // false until first valid thermocouple read
+uint8_t tipFaultCount = 0;
 
 // Power
 float VOLTAGE = 0, CURRENT = 0, POWER = 0;
+float iOffsetV = 0;       // amplifier zero-current offset (measured at boot)
+bool iSaturated = false;
+float pFullEst = 0;       // estimated power at 100 % duty (W)
+double powerCap = 255;    // max allowed PWM value from power limiter
+uint8_t lastDuty = 0;     // PWM value actually applied
 
 // Tips
-CalPoint calTable[TIPMAX][4];
-uint8_t numCalPoints[TIPMAX];
 char TipName[TIPMAX][TIPNAMELENGTH];
+int16_t tipTrim[TIPMAX];
+int16_t activeTrim = 0;
 uint8_t CurrentTip = 0;
 uint8_t NumberOfTips = 1;
 
@@ -210,18 +236,20 @@ uint8_t time2sleep = TIME2SLEEP;
 uint8_t time2off = TIME2OFF;
 uint8_t timeOfBoost = TIMEOFBOOST;
 uint8_t MainScrType = 1;
+uint8_t MaxPower = POWER_DEFAULT;
 bool PIDenable = PID_ENABLE;
 bool beepEnable = BEEP_ENABLE;
+bool debugMode = DEBUG_DEFAULT;
 
 // Timing
 uint32_t sleepmillis = 0;
 uint32_t boostmillis = 0;
 uint32_t sensorPreviousMillis = 0;
 uint32_t buzzerPreviousMillis = 0;
-uint8_t goneMinutes = 0;
+uint32_t goneMinutes = 0;
 uint8_t goneSeconds = 0;
 
-volatile bool handleMoved = false;
+volatile bool userActivity = false; // resets the sleep timer, never wakes
 
 // ============================================================================
 //  PID
@@ -229,12 +257,22 @@ volatile bool handleMoved = false;
 double aggKp = 30, aggKi = 0.5, aggKd = 5;
 double consKp = 12, consKi = 0.4, consKd = 8;
 PID ctrl(&Input, &Output, &Setpoint, aggKp, aggKi, aggKd, DIRECT);
+bool pidActive = false;
 
 // ============================================================================
 //  EEPROM
 // ============================================================================
-const uint32_t EEPROM_IDENT = 0xBEEFDEB0;
+const uint32_t EEPROM_IDENT = 0xBEEFDEB1; // bumped: struct layout changed
 Settings settings;
+
+// ============================================================================
+//  HEATER OUTPUT  (single place that touches CTRL_PIN)
+// ============================================================================
+void setHeater(uint8_t duty)
+{
+  lastDuty = duty;
+  analogWrite(CTRL_PIN, duty);
+}
 
 // ============================================================================
 //  ROTARY ENCODER
@@ -275,12 +313,8 @@ int getRotary()
   return value;
 }
 
-int16_t tipTrim[TIPMAX]; // stored per tip in EEPROM
-int16_t activeTrim = 0;  // loaded from tipTrim[CurrentTip], used by calculateTemp
-int16_t TempOffset[TIPMAX];
-
 // ============================================================================
-//  BUTTON
+//  BUTTONS
 // ============================================================================
 enum BtnState
 {
@@ -335,6 +369,13 @@ void handleButton()
   }
 }
 
+void wakeUp()
+{
+  mode = MODE_RUN;
+  sleepmillis = millis();
+  userActivity = true;
+}
+
 void processButton()
 {
   if (!globalButtonHandling)
@@ -343,26 +384,42 @@ void processButton()
   if (shortPress)
   {
     shortPress = false;
-    if (beepEnable)
-      BUZZ(40, 1);
+    BUZZ(40, 1);
+    userActivity = true;
 
     if (mode == MODE_OFF || mode == MODE_SLEEP)
     {
-      mode = MODE_RUN;
-      sleepmillis = millis();
+      wakeUp();
       return;
     }
     mode = (mode == MODE_BOOST) ? MODE_RUN : MODE_BOOST;
     boostmillis = millis();
-    handleMoved = true;
   }
 
   if (longPress)
   {
     longPress = false;
-    if (beepEnable)
-      BUZZ(120, 2); // beep here, not inside handleButton
+    BUZZ(120, 2);
     SetupScreen();
+  }
+}
+
+// Dedicated ENABLE button (rising edge). Wakes from standby / off.
+void handleEnableButton()
+{
+  static bool last = (digitalRead(ENABLE_PIN) == ENABLE_ACTIVE_LEVEL);
+  static uint32_t lastChange = 0;
+
+  bool now = (digitalRead(ENABLE_PIN) == ENABLE_ACTIVE_LEVEL);
+  if (now != last && (millis() - lastChange) > DEBOUNCE_TIME)
+  {
+    lastChange = millis();
+    last = now;
+    if (now && (mode == MODE_SLEEP || mode == MODE_OFF))
+    {
+      BUZZ(100, 1);
+      wakeUp();
+    }
   }
 }
 
@@ -392,34 +449,74 @@ void BUZZ(long duration, int buzzcount)
   digitalWrite(BUZZ_PIN, LOW);
 }
 
+// ============================================================================
+//  SENSOR  (MAX6675 returns NAN when the thermocouple is open / tip missing)
+// ============================================================================
 void SENSORCheck()
 {
-  float rawTemp = thermocouple.readCelsius();
+  float raw = thermocouple.readCelsius();
+  bool valid = !isnan(raw) && raw >= 0.0f && raw <= 1023.75f;
+
+  if (!valid)
+  {
+    // Never feed NAN into the filter: it would poison SmoothedTEMP and the
+    // PID forever (this was the "won't heat" bug).
+    if (tipFaultCount < 255)
+      tipFaultCount++;
+    if (tipFaultCount >= TIP_FAULT_COUNT)
+    {
+      tipOK = false;
+      tempInit = false; // re-seed filter when the tip comes back
+    }
+    return;
+  }
+
+  tipFaultCount = 0;
+  tipOK = true;
 
   if (!tempInit)
   {
-    SmoothedTEMP = rawTemp;
+    SmoothedTEMP = raw;
     tempInit = true;
   }
   else
   {
-    SmoothedTEMP += SMOOTHIE * (rawTemp - SmoothedTEMP);
+    SmoothedTEMP += SMOOTHIE * (raw - SmoothedTEMP);
   }
 
-  CurrentTemp = SmoothedTEMP;
+  CurrentTemp = SmoothedTEMP + activeTrim;
+}
+
+// Show "tip missing" once per event (disabled in debug mode)
+void TipCheck()
+{
+  static bool shown = false;
+
+  if (tipOK)
+  {
+    shown = false;
+    return;
+  }
+  if (debugMode || shown)
+    return;
+
+  shown = true;
+  setHeater(0);
+  mode = MODE_SLEEP; // come back in standby, not full heat
+  MessageScreen(TipMissingMessage, 3);
+  shortPress = false;
+  longPress = false;
+  sleepmillis = millis();
 }
 
 // ============================================================================
-//  THERMOSTAT  (adaptive PID)
+//  THERMOSTAT  (adaptive PID or direct, limited by the power limiter)
 // ============================================================================
-
-bool pidActive = false;
-
 void Thermostat()
 {
-  if (mode == MODE_OFF)
+  if (mode == MODE_OFF || !tipOK)
   {
-    analogWrite(CTRL_PIN, 0);
+    setHeater(0);
     if (pidActive)
     {
       ctrl.SetMode(MANUAL);
@@ -447,23 +544,193 @@ void Thermostat()
     Setpoint = SetTemp;
     break;
   }
+  if (Setpoint > TEMP_MAX)
+    Setpoint = TEMP_MAX;
 
   Input = CurrentTemp;
-  gap = (uint16_t)fabsf(Setpoint - Input);
+  gap = (uint16_t)fabsf((float)(Setpoint - Input));
 
-  bool nearTarget = (gap < 15);
-  ctrl.SetTunings(
-      nearTarget ? consKp : aggKp,
-      nearTarget ? consKi : aggKi,
-      nearTarget ? consKd : aggKd);
-  ctrl.Compute();
+  if (PIDenable)
+  {
+    bool nearTarget = (gap < 15);
+    ctrl.SetTunings(
+        nearTarget ? consKp : aggKp,
+        nearTarget ? consKi : aggKi,
+        nearTarget ? consKd : aggKd);
+    ctrl.Compute();
+  }
+  else
+  {
+    Output = (Input < Setpoint) ? powerCap : 0; // simple on/off
+  }
 
   if (mode == MODE_RUN && gap <= 3)
     mode = MODE_HOLD;
   else if (mode == MODE_HOLD && gap >= 6)
     mode = MODE_RUN;
 
-  analogWrite(CTRL_PIN, (uint8_t)Output);
+  if (isnan(Output))
+    Output = 0;
+  if (Output > powerCap)
+    Output = powerCap;
+  if (Output < 0)
+    Output = 0;
+
+  setHeater((uint8_t)Output);
+}
+
+// ============================================================================
+//  POWER MEASUREMENT  (0.01 ohm shunt + amplifier)
+// ============================================================================
+
+// Average the shunt amplifier output over ~2 PWM periods so the reading is
+// the average heater current regardless of where in the PWM cycle we sample.
+float readShuntCurrent()
+{
+  uint32_t t0 = micros();
+  uint32_t sum = 0;
+  uint16_t n = 0;
+  while ((uint32_t)(micros() - t0) < I_SAMPLE_US)
+  {
+    sum += analogRead(I_PIN);
+    n++;
+  }
+  float adc = n ? ((float)sum / n) : 0.0f;
+  iSaturated = (adc >= 4000.0f);
+
+  float volts = adc * ADC_VREF / ADC_MAX;
+  float vShunt = (volts - iOffsetV) / I_AMP_GAIN; // volts across the shunt
+  float amps = vShunt / SHUNT_OHMS;               // I = V / R
+  return (amps < 0) ? 0 : amps;
+}
+
+// Measure the amplifier's zero-current offset. Call with the heater OFF.
+void calibrateCurrentOffset()
+{
+  setHeater(0);
+  delay(50);
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < 64; i++)
+  {
+    sum += analogRead(I_PIN);
+    delay(1);
+  }
+  iOffsetV = ((float)sum / 64.0f) * ADC_VREF / ADC_MAX;
+}
+
+void measurePower()
+{
+  uint32_t sv = 0;
+  for (uint8_t i = 0; i < 8; i++)
+    sv += analogRead(VIN_PIN);
+  VOLTAGE = (((float)sv / 8.0f) * ADC_VREF / ADC_MAX) / VIN_DIV;
+
+  CURRENT = readShuntCurrent();
+  POWER = VOLTAGE * CURRENT;
+}
+
+// Max-power limiter.
+// avg power = P_full * duty, so P_full is estimated from the measurement and
+// the duty cap is MaxPower / P_full.  The cap is also applied as the PID output
+// limit, which gives free anti-windup.
+void updatePowerLimit()
+{
+  float dutyFrac = lastDuty / 255.0f;
+
+  if (dutyFrac >= 0.08f && POWER > 2.0f)
+  {
+    float pf = POWER / dutyFrac;
+    pFullEst = (pFullEst <= 0) ? pf : pFullEst + 0.4f * (pf - pFullEst);
+  }
+  else if (pFullEst <= 0 && VOLTAGE > VOLTAGE_MIN)
+  {
+    pFullEst = (VOLTAGE * VOLTAGE) / TIP_R_NOMINAL; // first guess
+  }
+
+  float cap = (pFullEst > 0) ? (255.0f * MaxPower / pFullEst) : 255.0f;
+
+  // Reactive guard: measured power already above the limit
+  if (POWER > MaxPower * 1.1f && lastDuty > 0)
+  {
+    float c = lastDuty * (float)MaxPower / POWER;
+    if (c < cap)
+      cap = c;
+  }
+
+  if (cap > 255.0f)
+    cap = 255.0f;
+  if (cap < 4.0f)
+    cap = 4.0f;
+
+  powerCap = cap;
+  ctrl.SetOutputLimits(0, powerCap);
+}
+
+void raiseFault(const char *msg[], uint8_t n)
+{
+  mode = MODE_OFF;
+  setHeater(0);
+  Output = 0;
+  MessageScreen(msg, n);
+  shortPress = false;
+  longPress = false;
+  sleepmillis = millis();
+}
+
+void PowerCheck()
+{
+  measurePower();
+
+  // Over-current: always active
+  static uint8_t ocCount = 0;
+  if (CURRENT >= CURRENT_LIMIT || iSaturated)
+  {
+    if (++ocCount >= 2)
+    {
+      ocCount = 0;
+      raiseFault(OverCURRmessage, 2);
+      return;
+    }
+  }
+  else
+    ocCount = 0;
+
+  // Supply voltage: disabled in debug mode
+  if (!debugMode)
+  {
+    static uint8_t vCount = 0;
+    if (VOLTAGE >= VOLTAGE_MAX || (VOLTAGE > 0.5f && VOLTAGE <= VOLTAGE_MIN))
+    {
+      if (++vCount >= 3)
+      {
+        vCount = 0;
+        raiseFault(OverVOLTmessage, 2);
+        return;
+      }
+    }
+    else
+      vCount = 0;
+  }
+
+  updatePowerLimit();
+}
+
+// One full measure -> limit -> control cycle (order matters)
+void runControlCycle()
+{
+  PowerCheck(); // current/power must be measured while the heater is still ON
+
+  if (lastDuty > 0)
+  {
+    analogWrite(CTRL_PIN, 0); // cut heater; lastDuty keeps the old value on purpose
+    uint32_t t0 = millis();
+    while (millis() - t0 < TEMP_SETTLE_MS)
+    {
+    }
+  }
+
+  SENSORCheck();  // heater is OFF here
+  Thermostat();   // computes the new duty and re-enables the heater via setHeater()
 }
 
 // ============================================================================
@@ -471,7 +738,13 @@ void Thermostat()
 // ============================================================================
 void ROTARYCheck()
 {
+  static uint16_t lastSet = 0;
   SetTemp = (uint16_t)getRotary();
+  if (SetTemp != lastSet)
+  {
+    lastSet = SetTemp;
+    userActivity = true;
+  }
 
   if (mode == MODE_BOOST && timeOfBoost)
   {
@@ -479,95 +752,49 @@ void ROTARYCheck()
     if (goneSeconds >= timeOfBoost)
     {
       mode = MODE_RUN;
-      if (beepEnable)
-        BUZZ(200, 1);
+      BUZZ(200, 1);
     }
   }
 }
 
 // ============================================================================
-//  SLEEP CHECK
+//  SLEEP CHECK   (SLEEPCheck() was never called in v0.5)
+//  Wake-up is ONLY by the enable button / encoder press.
 // ============================================================================
 void SLEEPCheck()
 {
-  bool onStand = digitalRead(HANDLE_SENSE_PIN); // active LOW = on stand
+  bool onStand = (digitalRead(HANDLE_SENSE_PIN) == STAND_ACTIVE_LEVEL);
 
   if (onStand)
   {
     if (mode == MODE_RUN || mode == MODE_BOOST || mode == MODE_HOLD)
     {
       mode = MODE_SLEEP;
-      analogWrite(CTRL_PIN, 0);
-      if (beepEnable)
-        BUZZ(150, 1);
+      BUZZ(150, 1);
     }
     return;
   }
 
-  if (handleMoved)
+  if (userActivity)
   {
-    if (mode == MODE_SLEEP || mode == MODE_OFF)
-    {
-      mode = MODE_RUN;
-      if (beepEnable)
-        BUZZ(100, 1);
-    }
-    handleMoved = false;
+    userActivity = false;
     sleepmillis = millis();
   }
 
-  goneMinutes = (uint8_t)((millis() - sleepmillis) / 60000UL);
+  goneMinutes = (millis() - sleepmillis) / 60000UL;
 
   if (mode != MODE_SLEEP && mode != MODE_OFF && time2sleep > 0 && goneMinutes >= time2sleep)
   {
     mode = MODE_SLEEP;
-    analogWrite(CTRL_PIN, 0);
-    if (beepEnable)
-      BUZZ(400, 2);
+    BUZZ(400, 2);
   }
 
   if (mode != MODE_OFF && time2off > 0 && goneMinutes >= time2off)
   {
     mode = MODE_OFF;
-    analogWrite(CTRL_PIN, 0);
-    if (beepEnable)
-      BUZZ(600, 1);
+    setHeater(0);
+    BUZZ(600, 1);
   }
-}
-
-// ============================================================================
-//  POWER CHECK
-// ============================================================================
-void PowerCheck()
-{
-  long rawV = analogRead(VIN_PIN);
-  long rawI = analogRead(I_PIN);
-
-  VOLTAGE = (rawV * 3.3f / 4095.0f) / 0.09f;
-
-  if (rawI < 1365)
-    CURRENT = map(rawI, 0, 1365, 0, 800) / 1000.0f;
-  else if (rawI < 2730)
-    CURRENT = map(rawI, 1365, 2730, 800, 2500) / 1000.0f;
-  else
-    CURRENT = map(rawI, 2730, 4095, 2500, 4200) / 1000.0f;
-
-  POWER = VOLTAGE * CURRENT;
-
-  if (CURRENT >= CURRENT_LIMIT)
-  {
-    mode = MODE_OFF;
-    analogWrite(CTRL_PIN, 0);
-    MessageScreen(OverCURRmessage, 2);
-  }
-  /*
-   if (VOLTAGE >= VOLTAGE_MAX || (VOLTAGE > 0.5f && VOLTAGE <= VOLTAGE_MIN))
-   {
-     mode = MODE_OFF;
-     analogWrite(CTRL_PIN, 0);
-     MessageScreen(OverVOLTmessage, 2);
-   }
-     */
 }
 
 // ============================================================================
@@ -604,8 +831,7 @@ void LED_Handler()
 // ============================================================================
 void MainScreen()
 {
-  SetTemp = (uint16_t)getRotary();
-  uint8_t pwmPct = (uint8_t)map((long)Output, 0, 255, 0, 100);
+  uint8_t pwmPct = (uint8_t)((uint16_t)lastDuty * 100 / 255);
 
   u8g.firstPage();
   do
@@ -640,37 +866,41 @@ void MainScreen()
       u8g.print(F("-----"));
       break;
     }
-    // clang-format off
- 
+
     u8g.drawHLine(0, 14, 128);
 
     // ── Centre: large current temperature ───────────────────────────────
     u8g.setFont(u8g2_font_fub25_tf);
     u8g.setFontPosTop();
 
-    if (CurrentTemp > TEMP_MAX)
+    if (!tipOK)
+    {
+      u8g.setCursor(35, 17);
+      u8g.print(F("---"));
+    }
+    else if (CurrentTemp > TEMP_MAX)
     {
       u8g.setCursor(35, 17);
       u8g.print(F("OVT"));
     }
     else
     {
-      u8g.setCursor((CurrentTemp < 10) ? 100 : (CurrentTemp < 100) ? 68: 48,17);
-      u8g.print((uint16_t)CurrentTemp);
+      uint16_t t = (CurrentTemp < 0) ? 0 : (uint16_t)CurrentTemp;
+      u8g.setCursor((t < 10) ? 100 : (t < 100) ? 68 : 48, 17);
+      u8g.print(t);
     }
 
-    // °C — small font, top-right of temp area
     u8g.setFont(u8g2_font_9x15_tf);
     u8g.setFontPosTop();
     u8g.setCursor(106, 30);
-    u8g.print(F("\xb0""C"));
+    u8g.print(DEG "C");
 
     // ── Bottom bar ───────────────────────────────────────────────────────
     u8g.drawHLine(0, 48, 128);
 
-    // PWM%
+    // Max power setting
     u8g.setCursor(0, 51);
-    u8g.print(POWER_SELECTED);
+    u8g.print((uint16_t)MaxPower);
     u8g.print(F("W"));
 
     u8g.setCursor(0, 18);
@@ -694,26 +924,17 @@ void MainScreen()
     // SET temp
     u8g.setCursor(43, 51);
     u8g.print(F("SET:"));
-    if (SetTemp < 100)
-    {
-      u8g.setCursor(89, 51);
-    }
-    else
-    {
-      u8g.setCursor(80, 51);
-    }
+    u8g.setCursor((SetTemp < 100) ? 89 : 80, 51);
     u8g.print(SetTemp);
-    u8g.print(F("\xb0""C"));
+    u8g.print(DEG "C");
 
     // Boost countdown
     if (mode == MODE_BOOST && timeOfBoost > 0)
     {
       u8g.setCursor(50, 0);
-      u8g.print(timeOfBoost - goneSeconds);
+      u8g.print((int)timeOfBoost - (int)goneSeconds);
       u8g.print(F("s"));
     }
-
-    // clang-format on
 
   } while (u8g.nextPage());
 }
@@ -760,8 +981,7 @@ uint8_t MenuScreen(const char *Items[], uint8_t numberOfItems, uint8_t selected)
     }
   } while (digitalRead(ENC_SW_PIN) || lastbutton);
 
-  if (beepEnable)
-    BUZZ(60, 1);
+  BUZZ(60, 1);
   return selected;
 }
 
@@ -869,24 +1089,27 @@ uint8_t InputNameScreen()
 }
 
 // ============================================================================
-//  INFO SCREEN
+//  INFO SCREEN  (heater OFF while shown; live sensor + power readings)
 // ============================================================================
 void InfoScreen()
 {
   bool exiting = false;
+  uint32_t lastRead = 0;
   shortPress = false;
   longPress = false;
   globalButtonHandling = false;
+  setHeater(0);
 
   while (!exiting)
   {
     handleButton();
 
-    // Take a fresh sensor read every iteration for live ADC display
-    analogWrite(CTRL_PIN, 0);
-    delayMicroseconds(TIME2SETTLE);
-    float liveADC = SmoothedTEMP;
-    analogWrite(CTRL_PIN, (mode == MODE_OFF) ? 0 : (uint8_t)Output);
+    if (millis() - lastRead >= SENSOR_INTERVAL)
+    {
+      lastRead = millis();
+      SENSORCheck();
+      measurePower();
+    }
 
     u8g.firstPage();
     do
@@ -895,37 +1118,35 @@ void InfoScreen()
       u8g.setFont(u8g2_font_9x15_tf);
       u8g.setFontPosTop();
 
-      // Row 0 — firmware version
       u8g.setCursor(0, 0);
-      u8g.print(F("FW: "));
-      u8g.print(F(VERSION));
+      u8g.print(F("FW: " VERSION));
+      if (debugMode)
+        u8g.print(F(" DBG"));
 
-      // Row 1 — raw ADC (live)
       u8g.setCursor(0, 13);
-      u8g.print(F("ADC: "));
-      u8g.print((uint16_t)liveADC);
-      u8g.print(F("  /4095"));
+      u8g.print(F("RAW: "));
+      u8g.print((int)SmoothedTEMP);
+      u8g.print(DEG "C");
 
-      // Row 2 — calculated temperature
       u8g.setCursor(0, 26);
-      u8g.print(F("TMP: "));
-      u8g.print((uint16_t)CurrentTemp);
-      u8g.print(F("\xb0"
-                  "C  trim:"));
+      if (tipOK)
+        u8g.print((int)CurrentTemp);
+      else
+        u8g.print(F("NO TIP"));
+      u8g.print(DEG "C T:");
+      u8g.print((int)activeTrim);
 
-      // Row 3 — voltage and current
       u8g.setCursor(0, 39);
       u8g.print(VOLTAGE, 1);
       u8g.print(F("V "));
       u8g.print(CURRENT, 2);
       u8g.print(F("A "));
-      u8g.print(POWER, 1);
+      u8g.print((int)POWER);
       u8g.print(F("W"));
 
-      // Row 4 — PID output and mode
       u8g.setCursor(0, 52);
-      u8g.print(F("OUT:"));
-      u8g.print((uint8_t)map((long)Output, 0, 255, 0, 100));
+      u8g.print(F("CAP:"));
+      u8g.print((int)(powerCap * 100.0 / 255.0));
       u8g.print(F("% "));
       switch (mode)
       {
@@ -933,7 +1154,7 @@ void InfoScreen()
         u8g.print(F("OFF"));
         break;
       case MODE_SLEEP:
-        u8g.print(F("SLEEP"));
+        u8g.print(F("STBY"));
         break;
       case MODE_RUN:
         u8g.print(F("RUN"));
@@ -945,15 +1166,10 @@ void InfoScreen()
         u8g.print(F("BOOST"));
         break;
       }
-
     } while (u8g.nextPage());
 
     if (shortPress || longPress)
-    {
-      shortPress = false;
-      longPress = false;
       exiting = true;
-    }
   }
 
   globalButtonHandling = true;
@@ -998,9 +1214,9 @@ void ChangeTipScreen()
     }
   } while (digitalRead(ENC_SW_PIN) || lastbutton);
 
-  if (beepEnable)
-    BUZZ(60, 1);
+  BUZZ(60, 1);
   CurrentTip = selected;
+  activeTrim = tipTrim[CurrentTip]; // v0.5 forgot to load the new tip's trim
 }
 
 // ============================================================================
@@ -1025,17 +1241,16 @@ void DeleteTipScreen()
     for (uint8_t i = CurrentTip; i < NumberOfTips - 1; i++)
     {
       memcpy(TipName[i], TipName[i + 1], TIPNAMELENGTH);
-      memcpy(calTable[i], calTable[i + 1], sizeof(CalPoint) * 4);
-      numCalPoints[i] = numCalPoints[i + 1];
+      tipTrim[i] = tipTrim[i + 1]; // trim must shift with the tip
     }
   }
   NumberOfTips--;
+  activeTrim = tipTrim[CurrentTip];
 }
 
 // ============================================================================
 //  ADD TIP SCREEN
 // ============================================================================
-
 void AddTipScreen()
 {
   if (NumberOfTips >= TIPMAX)
@@ -1044,12 +1259,9 @@ void AddTipScreen()
     return;
   }
   CurrentTip = NumberOfTips++;
+  tipTrim[CurrentTip] = 0;
+  activeTrim = 0;
   InputNameScreen();
-  calTable[CurrentTip][0] = {800, 150};
-  calTable[CurrentTip][1] = {1600, 220};
-  calTable[CurrentTip][2] = {2800, 310};
-  calTable[CurrentTip][3] = {3800, 390};
-  numCalPoints[CurrentTip] = 4;
 }
 
 // ============================================================================
@@ -1087,7 +1299,7 @@ void TipScreen()
 }
 
 // ============================================================================
-//  TEMP SCREEN
+//  TEMP SCREEN  (includes Max Power)
 // ============================================================================
 void TempScreen()
 {
@@ -1095,7 +1307,7 @@ void TempScreen()
   bool repeat = true;
   while (repeat)
   {
-    sel = MenuScreen(TempItems, 5, sel);
+    sel = MenuScreen(TempItems, 6, sel);
     switch (sel)
     {
     case 0:
@@ -1109,6 +1321,10 @@ void TempScreen()
     case 2:
       setRotary(10, 100, 5, BoostTemp);
       BoostTemp = (uint8_t)InputScreen(BoostTempItems);
+      break;
+    case 3:
+      setRotary(POWER_MIN, POWER_MAX_ABS, 5, MaxPower);
+      MaxPower = (uint8_t)InputScreen(MaxPowerItems);
       break;
     default:
       repeat = false;
@@ -1149,16 +1365,13 @@ void TimerScreen()
 }
 
 // ============================================================================
-//  GENERAL SCREEN  (PID / Direct control toggle)
+//  GENERAL SCREEN  (PID / Direct control toggle — now actually used)
 // ============================================================================
 void GeneralScreen()
 {
   uint8_t sel = PIDenable ? 1 : 0;
   sel = MenuScreen(ControlTypeItems, 3, sel);
-  if (sel == 0)
-    PIDenable = false;
-  if (sel == 1)
-    PIDenable = true;
+  PIDenable = (sel == 1);
 }
 
 // ============================================================================
@@ -1166,14 +1379,14 @@ void GeneralScreen()
 // ============================================================================
 void SetupScreen()
 {
-  analogWrite(CTRL_PIN, 0);
+  setHeater(0);
   uint16_t savedTemp = SetTemp;
   uint8_t sel = 0;
   bool repeat = true;
 
   while (repeat)
   {
-    sel = MenuScreen(SetupItems, 8, sel);
+    sel = MenuScreen(SetupItems, 9, sel);
     switch (sel)
     {
     case 0:
@@ -1194,6 +1407,9 @@ void SetupScreen()
     case 5:
       InfoScreen();
       break;
+    case 6:
+      debugMode = (bool)MenuScreen(DebugItems, 3, (uint8_t)debugMode);
+      break;
     default:
       repeat = false;
       break;
@@ -1201,33 +1417,48 @@ void SetupScreen()
   }
 
   saveSettings();
-  handleMoved = true;
+  userActivity = true; // reset sleep timer only; does NOT wake from standby
   SetTemp = savedTemp;
   setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, SetTemp);
+  pFullEst = 0; // re-learn after possible changes
 }
 
 // ============================================================================
 //  CALIBRATION SCREEN
+//  Heats to the default temp so you can compare against a reference
+//  thermometer, then adjust the trim.  Press = save, long press = cancel.
 // ============================================================================
-
 void CalibrationScreen()
 {
   globalButtonHandling = false;
   shortPress = false;
   longPress = false;
 
-  // Start encoder at current tip's trim value
+  uint8_t prevMode = mode;
+  uint16_t prevSet = SetTemp;
+  mode = MODE_RUN;
+  SetTemp = DefaultTemp;
+
   setRotary(-200, 200, 1, (int)tipTrim[CurrentTip]);
 
   bool exiting = false;
+  uint32_t lastCycle = 0;
 
   while (!exiting)
   {
     handleButton();
 
+    if (millis() - lastCycle >= SENSOR_INTERVAL)
+    {
+      lastCycle = millis();
+      runControlCycle();
+    }
+
     int16_t trim = (int16_t)getRotary();
-    activeTrim = trim; // live preview while adjusting
-    uint16_t dispTemp = (uint16_t)CurrentTemp;
+    activeTrim = trim; // live preview
+    int16_t dispTemp = (int16_t)(SmoothedTEMP + trim);
+    if (dispTemp < 0)
+      dispTemp = 0;
 
     u8g.firstPage();
     do
@@ -1236,39 +1467,41 @@ void CalibrationScreen()
       u8g.setFont(u8g2_font_9x15_tf);
       u8g.setFontPosTop();
 
-      // ── Top bar ───────────────────────────────────────────────────────
       u8g.setCursor(0, 0);
       u8g.print(TipName[CurrentTip]);
       u8g.setCursor(62, 0);
       u8g.print(F("CALIBRATE"));
       u8g.drawHLine(0, 14, 128);
 
-      // ── Live temperature (large) ──────────────────────────────────────
       u8g.setFont(u8g2_font_fub25_tf);
       u8g.setFontPosTop();
-      if (dispTemp < 10)
-        u8g.setCursor(36, 17);
-      else if (dispTemp < 100)
-        u8g.setCursor(18, 17);
-      else
+      if (!tipOK)
+      {
         u8g.setCursor(0, 17);
-      u8g.print(dispTemp);
+        u8g.print(F("---"));
+      }
+      else
+      {
+        if (dispTemp < 10)
+          u8g.setCursor(36, 17);
+        else if (dispTemp < 100)
+          u8g.setCursor(18, 17);
+        else
+          u8g.setCursor(0, 17);
+        u8g.print(dispTemp);
+      }
 
       u8g.setFont(u8g2_font_9x15_tf);
       u8g.setFontPosTop();
       u8g.setCursor(82, 17);
-      u8g.print(F("\xb0"
-                  "C now"));
+      u8g.print(DEG "C now");
 
-      // ── Bottom bar ────────────────────────────────────────────────────
       u8g.drawHLine(0, 44, 128);
       u8g.setCursor(0, 48);
       u8g.print(F("Trim:"));
       if (trim >= 0)
         u8g.print(F("+"));
       u8g.print((int)trim);
-      u8g.print(F("\xb0"
-                  "C"));
 
       u8g.setCursor(80, 48);
       u8g.print(F("Prs=save"));
@@ -1281,20 +1514,21 @@ void CalibrationScreen()
       tipTrim[CurrentTip] = trim;
       activeTrim = trim;
       saveSettings();
-      if (beepEnable)
-        BUZZ(80, 2);
+      BUZZ(80, 2);
       exiting = true;
     }
 
     if (longPress)
     {
       longPress = false;
-      // Cancel — restore old trim
-      activeTrim = tipTrim[CurrentTip];
+      activeTrim = tipTrim[CurrentTip]; // cancel
       exiting = true;
     }
   }
 
+  setHeater(0);
+  mode = prevMode;
+  SetTemp = prevSet;
   shortPress = false;
   longPress = false;
   globalButtonHandling = true;
@@ -1302,7 +1536,7 @@ void CalibrationScreen()
 }
 
 // ============================================================================
-//  LOAD SETTINGS
+//  LOAD / SAVE SETTINGS
 // ============================================================================
 void loadSettings()
 {
@@ -1310,6 +1544,7 @@ void loadSettings()
 
   if (settings.signature != EEPROM_IDENT)
   {
+    memset(&settings, 0, sizeof(settings));
     settings.signature = EEPROM_IDENT;
     settings.DefaultTemp = TEMP_DEFAULT;
     settings.SleepTemp = TEMP_SLEEP;
@@ -1322,10 +1557,13 @@ void loadSettings()
     settings.beepEnable = BEEP_ENABLE;
     settings.CurrentTip = 0;
     settings.NumberOfTips = 1;
+    settings.MaxPower = POWER_DEFAULT;
+    settings.debugMode = DEBUG_DEFAULT;
     for (uint8_t i = 0; i < TIPMAX; i++)
     {
       settings.TempOffset[i] = 0;
       strncpy(settings.TipName[i], TIPNAME, TIPNAMELENGTH);
+      settings.TipName[i][TIPNAMELENGTH - 1] = 0;
     }
     EEPROM.put(0, settings);
     EEPROM.commit();
@@ -1342,9 +1580,23 @@ void loadSettings()
   beepEnable = settings.beepEnable;
   CurrentTip = settings.CurrentTip;
   NumberOfTips = settings.NumberOfTips;
+  MaxPower = settings.MaxPower;
+  debugMode = settings.debugMode;
 
   memcpy(tipTrim, settings.TempOffset, sizeof(tipTrim));
   memcpy(TipName, settings.TipName, sizeof(TipName));
+
+  // Sanity checks
+  if (NumberOfTips < 1 || NumberOfTips > TIPMAX)
+    NumberOfTips = 1;
+  if (CurrentTip >= NumberOfTips)
+    CurrentTip = 0;
+  if (DefaultTemp < TEMP_MIN || DefaultTemp > TEMP_MAX)
+    DefaultTemp = TEMP_DEFAULT;
+  if (MaxPower < POWER_MIN || MaxPower > POWER_MAX_ABS)
+    MaxPower = POWER_DEFAULT;
+  for (uint8_t i = 0; i < TIPMAX; i++)
+    TipName[i][TIPNAMELENGTH - 1] = 0;
 
   activeTrim = tipTrim[CurrentTip];
 }
@@ -1363,6 +1615,8 @@ void saveSettings()
   settings.beepEnable = beepEnable;
   settings.CurrentTip = CurrentTip;
   settings.NumberOfTips = NumberOfTips;
+  settings.MaxPower = MaxPower;
+  settings.debugMode = debugMode;
 
   memcpy(settings.TempOffset, tipTrim, sizeof(tipTrim));
   memcpy(settings.TipName, TipName, sizeof(TipName));
@@ -1370,12 +1624,12 @@ void saveSettings()
   EEPROM.put(0, settings);
   EEPROM.commit();
 }
+
 // ============================================================================
 //  SETUP
 // ============================================================================
 void setup()
 {
-
   pinMode(VIN_PIN, INPUT_ANALOG);
   pinMode(I_PIN, INPUT_ANALOG);
   pinMode(HANDLE_SENSE_PIN, INPUT_PULLDOWN);
@@ -1389,37 +1643,39 @@ void setup()
   pinMode(LED_G_PIN, OUTPUT);
   pinMode(LED_B_PIN, OUTPUT);
   pinMode(PB2, OUTPUT);
+  pinMode(PC13, OUTPUT);
 
   digitalWrite(BUZZ_PIN, LOW);
-  analogWrite(CTRL_PIN, 0); // heater OFF on boot
+  digitalWrite(PC13, HIGH);
+
+  analogReadResolution(12);
+  analogWriteFrequency(1000);
+  setHeater(0); // heater OFF on boot
 
   u8g.begin();
   u8g.enableUTF8Print();
 
-  analogReadResolution(12);
-  analogWriteFrequency(1000);
-
-  // PID: output 0=full heat, 255=off  → limits reversed
-  ctrl.SetOutputLimits(0, 255);
-  ctrl.SetMode(AUTOMATIC);
-
   loadSettings();
 
-  activeTrim = tipTrim[CurrentTip];
+  ctrl.SetOutputLimits(0, 255);
+  ctrl.SetMode(MANUAL); // Thermostat() enables it when needed
+  pidActive = false;
+
+  calibrateCurrentOffset(); // heater is off here
 
   attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), rotaryISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), rotaryISR, CHANGE);
 
   SetTemp = DefaultTemp;
-  mode = MODE_RUN; // start in RUN, heater will activate immediately
-  pidActive = false;
-  sleepmillis = millis();
-
   setRotary(TEMP_MIN, TEMP_MAX, TEMP_STEP, DefaultTemp);
 
-  digitalWrite(PC13, HIGH);
-  delay(3000);
-  digitalWrite(PC13, LOW);
+  // Let the MAX6675 finish its first conversion, then prime the filter
+  delay(300);
+  SENSORCheck();
+  SENSORCheck();
+
+  mode = MODE_SLEEP; // straight to standby; press enable to heat
+  sleepmillis = millis();
 
   BUZZ(300, 2);
 }
@@ -1434,16 +1690,18 @@ void loop()
   if (now - sensorPreviousMillis >= SENSOR_INTERVAL)
   {
     sensorPreviousMillis = now;
-    SENSORCheck();
-    Thermostat();
-    PowerCheck();
+    runControlCycle(); // sensor -> power/limit -> thermostat
   }
 
   handleButton();
   processButton();
+  handleEnableButton();
   ROTARYCheck();
+  SLEEPCheck();
+  TipCheck();
   MainScreen();
   LED_Handler();
 
-  digitalWrite(PC13, HIGH);
+  // heartbeat on the on-board LED (blue pill: LOW = on)
+  digitalWrite(PC13, (now / 500) & 1);
 }
